@@ -1,0 +1,255 @@
+---
+title: |
+  | **DS 223: Marketing Analytics**  
+  | Homework 3 - Survival Analysis
+author: "Alexander Shahramanyan"
+date: "April 28, 2024"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+classoption: a4paper
+urlcolor: blue
+header-includes:
+  - \usepackage{titling}
+  - \setlength{\droptitle}{-2cm}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, echo = TRUE, dev='pdf')
+```
+
+
+```{r echo=F}
+# Load the libraries
+library(survival)
+library(texreg)
+library(ggplot2)
+library(patchwork)
+library(tibble) 
+```
+
+To build AFT models, we first need to load the data. We will be working with the Telco Customer Churn dataset, which has the following columns:
+- ID: subscriber's ID
+- region: region code
+- tenure: lifetime (in months)
+- age: subscriber’s age
+- marital: subscriber’s marital status
+- address: number of years living in the same address
+- income: subscriber’s annual income (K)
+- ed: subscriber's education level
+- retire: retired (Yes/No)
+- gender: subscriber's gender (Male/Female)
+- voice: voice service (Yes/No)
+- internet: internet service (Yes/No)
+- forward: call forwarding (Yes/No)
+- custcat: customer category
+- churn: whether the customer churned (Yes/No)
+
+```{r}
+# Read the CSV file
+telco <- read.csv("telco.csv")
+telco$churn = ifelse(telco$churn=='Yes', 1, 0)
+
+head(telco)
+```
+Now, we will build basic models (intercept-only) with all the different distributions available in `survreg` package.
+
+```{r}
+surv_obj = Surv(time=telco$tenure, event=telco$churn)
+reg_models <- list()
+
+for(distribution in names(survreg.distributions)){
+    # get the regression model
+    reg_m = survreg(formula=surv_obj~1, dist=distribution)
+    
+    # print the summary
+    # summary(reg_m)
+    
+    # add reg_m to reg_models
+    reg_models[[distribution]] <- reg_m
+}
+```
+
+As we have the models now, let's visualize the probability of churn during customer lifetime using the models in different plots and have an initial look at them.
+
+
+```{r, fig.height=12, fig.width=10}
+# Initialize an empty list for storing plots
+plot_list <- list()
+
+for (distribution in names(survreg.distributions)) {
+    reg_m <- reg_models[[distribution]]
+    
+    probs <- seq(.1, .9, length=9)
+    pred <- predict(reg_m, type="quantile", p=1-probs, newdata=data.frame(1))
+    
+    df <- data.frame(Time=pred, Probabilities=probs)
+
+    # Generate the plot for current distribution
+    p <- ggplot(df, aes(x = Time, y = Probabilities)) +
+        geom_line() +
+        labs(title = paste("Survival Curve |", distribution),
+             x = "Survival Time",
+             y = "Survival Probability")
+    
+    # Store the plot in the list
+    plot_list[[distribution]] <- p
+}
+
+# Combine the plots into a grid (4x3) and leave the last two positions blank
+plot_grid <- wrap_plots(plot_list, nrow = 4, ncol = 3) +
+             plot_spacer() + plot_spacer()
+
+# Print the combined plot grid
+print(plot_grid)
+```
+
+As we can see, there are indeed some differences between the models. We can plot all the model curves in one graph to be able to compare the models.
+
+```{r, fig.height=8, fig.width=8}
+# Initialize an empty data frame for storing combined data
+combined_df <- data.frame()
+
+for (distribution in names(survreg.distributions)) {
+    reg_m <- reg_models[[distribution]]
+    
+    probs <- seq(.1, .9, length=9)
+    pred <- predict(reg_m, type="quantile", p=1-probs, newdata=data.frame(1))
+    
+    df <- data.frame(Time = pred, Probabilities = probs, Distribution = distribution)
+
+    # Combine data
+    combined_df <- rbind(combined_df, df)
+}
+
+# Generate a single plot with curves for all distributions
+p <- ggplot(combined_df, aes(x = Time, y = Probabilities, color = Distribution)) +
+    geom_line(linewidth=1.2) +
+    labs(title = "Survival Curves for Various Distributions",
+         x = "Survival Time",
+         y = "Survival Probability") +
+    theme_minimal()
+
+# Print the plot
+print(p)
+```
+Lognormal seems to be the better one, however, let's also compare the AIC and BIC.
+
+```{r}
+combined_scores <- data.frame(Distribution = character(), AIC = numeric(), BIC = numeric())
+
+
+for(distribution in names(survreg.distributions)){
+    reg_m <- reg_models[[distribution]]
+    
+    extracted_scores <- extract(
+      reg_m,
+      include.aic = TRUE,
+      include.bic = TRUE
+    )
+    
+    # Extract AIC and BIC names
+    score_names <- extracted_scores@gof.names
+    
+    # Find indices of AIC and BIC in the names
+    aic_index <- which(score_names == "AIC")
+    bic_index <- which(score_names == "BIC")
+    
+    # Extract AIC and BIC scores
+    aic <- extracted_scores@gof[aic_index]
+    bic <- extracted_scores@gof[bic_index]
+    
+    combined_scores <- rbind(combined_scores, 
+                             tibble(Distribution = distribution,
+                                    AIC = aic,
+                                    BIC = bic))
+}
+# Order the scores by AIC and BIC
+combined_scores_ordered <- combined_scores[order(combined_scores$AIC, combined_scores$BIC), ]
+
+# Print the combined scores data frame
+print(combined_scores_ordered)
+```
+
+As we can see the models with `loggaussian` and `lognormal` distributions have lower AIC and BIC. Let's pick the `lognormal` one go on with it. We'll train a new model adding some of the variables to it. But first, we'll define the order to some of the factor variables.
+
+```{r}
+# Define the education order
+ed_order <- c("Did not complete high school", "High school degree", "Some college", "College degree", "Post-undergraduate degree")
+
+# Apply the education order to the respective variable
+telco$ed <- factor(telco$ed, levels = ed_order)
+```
+
+Let's add gender all the columns to the model and then remove those that are not statistically significant to the model (we assume that the p-values of the models with only one covariate and the model with said covariate and some others are not very different).
+
+```{r}
+reg_f= survreg(surv_obj ~ region + age + marital + address + income + ed + retire + gender + voice + internet + forward + custcat,
+               data=telco, dist="lognormal")
+summary(reg_f)
+```
+As we can see, only the coefficients of `age`, `marital`, `voice`, `internet`, and `custcat` are statistically significant. Let's rebuild the model using only those. Let's also add `ed`, because, I suppose, it might also have some impact on the model (the p-value of some education levels are almost statistically significant).
+
+
+```{r}
+reg_f= survreg(surv_obj ~ age + marital +  voice + internet + custcat,
+               data=telco, dist="lognormal")
+summary(reg_f)
+```
+Now, as we have the model, let's have a look at AIC and BIC.
+
+```{r}
+extract(
+    reg_f,
+    include.aic = TRUE,
+    include.bic = TRUE
+)
+```
+
+As we can see the AIC and BIC are better than of the intercept-only model. Now, let's interpret the coefficients. Since we're using a `lognormal` distribution for the model, we'll need to exponentiate the coefficients returned by the model to understand the real effect of the covariates.
+
+```{r}
+exp(coef(reg_f))
+```
+
+## Report
+
+As we can see the coefficients for `maritalUnmarried`, `voiceYes`, and `internetYes` are less than one. From this we can conclude that unot married individuals, as well as individuals using voice and/or internet services have less life time, that is, they are more prone to churn earlier compared to married, individuals not using voice and internet services, respectively.
+
+On the contrary, `age` has a coefficient, which is greater than 1. This means as people get older, they are less prone to churn (the lifetime is longer). Same goes for the different customer categories; those using Plus service tend to have longer lifetime (2.4 times more), those using E-service and Total service are even less prone to churn (about 3 times longer lifetime), compared to individuals with Basic service.
+
+## CLV
+(Something is off here. I didn't have time to understand what the problem is before midnight. My next commits will solve the problem.)
+```{r}
+pred=predict(reg_f, type="response")
+
+pred_data=data.frame(t(pred))[,0:24]
+
+sequence = seq(1,length(colnames(pred_data)),1)
+MM = 1300
+r = 0.1
+
+for (num in sequence) {
+    pred_data[,num]=pred_data[,num]/(1+r/12)^(sequence[num]-1)
+}
+```
+
+
+```{r}
+pred_data$CLV=MM*rowSums(pred_data)
+summary(pred_data$CLV)
+```
+
+
+```{r}
+ggplot(pred_data,aes(x=CLV))+labs(title = "CLV Distribution")+
+geom_histogram()
+```
+
+
+```{r}
+telco$CLV = pred_data$CLV
+ggplot(telco,aes(x=CLV, color=gender))+
+labs(title = "CLV Density By Gender")+
+geom_density()
+```
